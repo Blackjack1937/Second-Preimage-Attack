@@ -3,6 +3,16 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <math.h>
+#define _POSIX_C_SOURCE 200809L
+#include <time.h>
+
+#include "xoshiro.h"
+#include <linux/time.h>
+
+#define EM_TABLE_LOG2 22u
+#define EM_TABLE_SIZE (1u << EM_TABLE_LOG2)
+#define HT_LOG2 (EM_TABLE_LOG2 + 1u)
+#define HT_SIZE (1u << HT_LOG2)
 
 #define ROTL24_16(x) ((((x) << 16) ^ ((x) >> 8)) & 0xFFFFFF)
 #define ROTL24_3(x) ((((x) << 3) ^ ((x) >> 21)) & 0xFFFFFF)
@@ -11,6 +21,13 @@
 #define ROTL24_21(x) ((((x) << 21) ^ ((x) >> 3)) & 0xFFFFFF)
 
 #define IV 0x010203040506ULL
+
+static double now_sec(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
 
 /*
  * the 96-bit key is stored in four 24-bit chunks in the low bits of k[0]...k[3]
@@ -197,12 +214,154 @@ int test_cs48_dm_fp(void)
 	return r == fp;
 }
 
+static inline uint32_t rnd24(void)
+{
+	return (uint32_t)(xoshiro256starstar_random() & 0xFFFFFFULL);
+}
+
+static inline void random_block4(uint32_t b[4])
+{
+	b[0] = rnd24();
+	b[1] = rnd24();
+	b[2] = rnd24();
+	b[3] = rnd24();
+}
+
+static inline uint64_t pack48(uint32_t lo24, uint32_t hi24)
+{
+	return (((uint64_t)(hi24 & 0xFFFFFF)) << 24) | (uint64_t)(lo24 & 0xFFFFFF);
+}
+
+static inline uint64_t mix64(uint64_t x)
+{
+	x ^= x >> 30;
+	x *= 0xbf58476d1ce4e5b9ULL;
+	x ^= x >> 27;
+	x *= 0x94d049bb133111ebULL;
+	x ^= x >> 31;
+	return x;
+}
+
+struct em_entry
+{
+	uint64_t key_plus1;
+	uint32_t m1[4];
+};
+
+static void ht_insert(struct em_entry *tab, uint64_t h, const uint32_t m1[4])
+{
+	uint64_t k = h + 1; // avoid 0
+	uint64_t idx = mix64(h) & (HT_SIZE - 1);
+	while (tab[idx].key_plus1 != 0)
+	{
+		idx = (idx + 1) & (HT_SIZE - 1);
+	}
+	tab[idx].key_plus1 = k;
+	tab[idx].m1[0] = m1[0];
+	tab[idx].m1[1] = m1[1];
+	tab[idx].m1[2] = m1[2];
+	tab[idx].m1[3] = m1[3];
+}
+
+static struct em_entry *ht_find(struct em_entry *tab, uint64_t h)
+{
+
+	uint64_t k = h + 1;
+	uint64_t idx = mix64(h) & (HT_SIZE - 1);
+	for (;;)
+	{
+		uint64_t kp1 = tab[idx].key_plus1;
+		if (kp1 == 0)
+			return NULL;
+		if (kp1 == k)
+			return &tab[idx];
+		idx = (idx + 1) & (HT_SIZE - 1);
+	}
+}
+
 /* Finds a two-block expandable message for hs48, using a fixed-point
  * That is, computes m1, m2 s.t. hs48_nopad(m1||m2) = hs48_nopad(m1||m2^*),
  * where hs48_nopad is hs48 with no padding */
 void find_exp_mess(uint32_t m1[4], uint32_t m2[4])
 {
-	/* FILL ME */
+	static struct em_entry *T = NULL;
+	if (!T)
+	{
+		T = (struct em_entry *)calloc(HT_SIZE, sizeof(struct em_entry));
+	}
+
+	for (uint32_t i = 0; i < EM_TABLE_SIZE; i++)
+	{
+		uint32_t t[4];
+		random_block4(t);
+		uint64_t h = cs48_dm(t, IV);
+		ht_insert(T, h, t);
+	}
+	for (;;)
+	{
+		uint32_t cand[4];
+		random_block4(cand);
+		uint64_t fp = get_cs48_dm_fp(cand);
+		struct em_entry *e = ht_find(T, fp);
+		if (e)
+		{
+			m1[0] = e->m1[0];
+			m1[1] = e->m1[1];
+			m1[2] = e->m1[2];
+			m1[3] = e->m1[3];
+			m2[0] = cand[0];
+			m2[1] = cand[1];
+			m2[2] = cand[2];
+			m2[3] = cand[3];
+			return;
+		}
+	}
+}
+
+int test_em(void)
+{
+	double t0 = now_sec();
+	uint32_t a[4], b[4];
+	find_exp_mess(a, b);
+	double t1 = now_sec();
+	printf("find_exp_mess time: %.3f s\n", t1 - t0);
+
+	uint64_t h1 = cs48_dm(a, IV);
+	uint64_t fp = get_cs48_dm_fp(b);
+
+	printf("EM found:\n");
+	printf(" m1 = {%06X,%06X,%06X,%06X}\n", a[0], a[1], a[2], a[3]);
+	printf(" m2 = {%06X,%06X,%06X,%06X}\n", b[0], b[1], b[2], b[3]);
+	printf(" h  = %06llX  fp(m2) = %06llX\n",
+		   (unsigned long long)h1, (unsigned long long)fp);
+
+	if (h1 != fp)
+	{
+		printf("expandable message check failed: h != fp\n");
+		return 0;
+	}
+
+	uint32_t buf[4 * 6]; //  m1 + up to 5 copies of m2
+	for (int i = 0; i < 4; i++)
+		buf[i] = a[i];
+
+	for (int i = 0; i < 4; i++)
+		buf[4 + i] = b[i]; // n=1
+	uint64_t r1 = hs48(buf, 2, 0, 0);
+
+	for (int i = 0; i < 4; i++)
+		buf[8 + i] = b[i]; // n=2
+	uint64_t r2 = hs48(buf, 3, 0, 0);
+
+	for (int j = 0; j < 3; j++)
+		for (int i = 0; i < 4; i++)
+			buf[12 + 4 * j + i] = b[i]; // n =5
+	uint64_t r5 = hs48(buf, 6, 0, 0);
+	printf(" hs48(m1||m2   ) = %06llX\n", (unsigned long long)r1);
+	printf(" hs48(m1||m2^2 ) = %06llX\n", (unsigned long long)r2);
+	printf(" hs48(m1||m2^5 ) = %06llX\n", (unsigned long long)r5);
+
+	return (r1 == h1) && (r2 == h1) && (r5 == h1);
 }
 
 void attack(void)
@@ -212,6 +371,10 @@ void attack(void)
 
 int main()
 {
+	// random seed
+	uint64_t seed[4] = {0, 1, 2, 3};
+	xoshiro256starstar_random_set(seed);
+
 	// attack();
 	if (!test_vector_okay())
 		return 1;
@@ -220,6 +383,8 @@ int main()
 	if (!test_cs48_dm())
 		return 1;
 	if (!test_cs48_dm_fp())
+		return 1;
+	if (!test_em())
 		return 1;
 	return 0;
 }
