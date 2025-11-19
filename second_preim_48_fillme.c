@@ -1,13 +1,13 @@
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <math.h>
-#define _POSIX_C_SOURCE 200809L
 #include <time.h>
 
 #include "xoshiro.h"
-#include <linux/time.h>
+#include <omp.h>
 
 #define EM_TABLE_LOG2 22u
 #define EM_TABLE_SIZE (1u << EM_TABLE_LOG2)
@@ -19,6 +19,9 @@
 
 #define ROTL24_8(x) ((((x) << 8) ^ ((x) >> 16)) & 0xFFFFFF)
 #define ROTL24_21(x) ((((x) << 21) ^ ((x) >> 3)) & 0xFFFFFF)
+
+#define CV_HT_LOG2 20u
+#define CV_HT_SIZE (1u << CV_HT_LOG2)
 
 #define IV 0x010203040506ULL
 
@@ -279,6 +282,41 @@ static struct em_entry *ht_find(struct em_entry *tab, uint64_t h)
 	}
 }
 
+// hellpers for attack 
+
+struct cv_entry {
+    uint64_t key_plus1;
+    uint32_t idx;
+};
+
+static void cv_ht_insert(struct cv_entry *tab, uint64_t h, uint32_t idx)
+{
+    uint64_t k = h + 1; /* avoid 0 */
+    uint64_t pos = mix64(h) & (CV_HT_SIZE - 1);
+
+    while (tab[pos].key_plus1 != 0) {
+        pos = (pos + 1) & (CV_HT_SIZE - 1);
+    }
+    tab[pos].key_plus1 = k;
+    tab[pos].idx = idx;
+}
+
+static struct cv_entry *cv_ht_find(struct cv_entry *tab, uint64_t h)
+{
+    uint64_t k = h + 1;
+    uint64_t pos = mix64(h) & (CV_HT_SIZE - 1);
+
+    for (;;) {
+        uint64_t kp1 = tab[pos].key_plus1;
+        if (kp1 == 0)
+            return NULL;
+        if (kp1 == k)
+            return &tab[pos];
+        pos = (pos + 1) & (CV_HT_SIZE - 1);
+    }
+}
+
+
 /* Finds a two-block expandable message for hs48, using a fixed-point
  * That is, computes m1, m2 s.t. hs48_nopad(m1||m2) = hs48_nopad(m1||m2^*),
  * where hs48_nopad is hs48 with no padding */
@@ -365,9 +403,148 @@ int test_em(void)
 }
 
 void attack(void)
-{
-	/* FILL ME */
+{	
+	double t_attack0 = now_sec();
+    const uint32_t L = 1u << 18;     //96
+    const uint32_t WORDS = L * 4u;    //24
+    uint32_t *mess = malloc((size_t)WORDS * sizeof(uint32_t));
+    if (!mess) {
+        perror("malloc mess");
+        exit(1);
+    }
+
+//msg
+    for (uint32_t i = 0; i < (1u << 20); i += 4) {
+        mess[i + 0] = i;
+        mess[i + 1] = 0;
+        mess[i + 2] = 0;
+        mess[i + 3] = 0;
+    }
+
+    uint64_t h_target = hs48(mess, L, 1, 0);
+    printf("target hash : %06llX\n", (unsigned long long)h_target);
+    if (h_target != 0x7CA651E182DBULL) {
+        printf("unexpected target hash, aborting attack\n");
+        free(mess);
+        return;
+    }
+
+
+    uint64_t *chain = malloc((size_t)(L + 1) * sizeof(uint64_t));
+    if (!chain) {
+        perror("malloc chain");
+        free(mess);
+        exit(1);
+    }
+
+    chain[0] = IV;
+    for (uint32_t b = 0; b < L; b++) {
+        chain[b + 1] = cs48_dm(&mess[4 * b], chain[b]);
+    }
+
+    struct cv_entry *CV = calloc(CV_HT_SIZE, sizeof(struct cv_entry));
+    if (!CV) {
+        perror("calloc CV");
+        free(chain);
+        free(mess);
+        exit(1);
+    }
+
+    for (uint32_t j = 0; j <= L; j++) {
+        cv_ht_insert(CV, chain[j], j);
+    }
+
+    uint32_t m1[4], m2[4];
+    double t0 = now_sec();
+    find_exp_mess(m1, m2);
+    double t1 = now_sec();
+    uint64_t fp = cs48_dm(m1, IV);
+
+    printf("Expandable message found in %.3f s\n", t1 - t0);
+    printf("  m1 = {%06X,%06X,%06X,%06X}\n", m1[0], m1[1], m1[2], m1[3]);
+    printf("  m2 = {%06X,%06X,%06X,%06X}\n", m2[0], m2[1], m2[2], m2[3]);
+    printf("  fp = %06llX\n", (unsigned long long)fp);
+
+    uint32_t cm[4];
+    uint32_t j_match = 0;
+    uint64_t trials = 0;
+    double t2 = now_sec();
+
+    for (;;) {
+        random_block4(cm);
+        uint64_t v = cs48_dm(cm, fp);
+        struct cv_entry *e = cv_ht_find(CV, v);
+        trials++;
+
+        if (e && e->idx >= 3) { 
+            j_match = e->idx;
+            printf("Collision found after %llu trials, j = %u\n",
+                   (unsigned long long)trials, j_match);
+            printf("  v = %06llX (matches chain[%u])\n",
+                   (unsigned long long)v, j_match);
+            break;
+        }
+    }
+
+    double t3 = now_sec();
+    printf("Collision search time: %.3f s\n", t3 - t2);
+
+    uint32_t n = j_match - 2;     
+    uint32_t lenE = 1u + n;        
+    printf("Using n = %u copies of m2 (len(E) = %u blocks)\n", n, lenE);
+
+    uint32_t *mess2 = malloc((size_t)WORDS * sizeof(uint32_t));
+    if (!mess2) {
+        perror("malloc mess2");
+        free(CV);
+        free(chain);
+        free(mess);
+        exit(1);
+    }
+
+    size_t pos = 0;
+    for (int i = 0; i < 4; i++)
+        mess2[pos++] = m1[i];
+
+    for (uint32_t k = 0; k < n; k++) {
+        for (int i = 0; i < 4; i++)
+            mess2[pos++] = m2[i];
+    }
+
+
+    for (int i = 0; i < 4; i++)
+
+        mess2[pos++] = cm[i];
+
+    
+
+    for (uint32_t b = j_match; b < L; b++) {
+        for (int i = 0; i < 4; i++)
+            mess2[pos++] = mess[4 * b + i];
+    }
+
+    if (pos != (size_t)WORDS) {
+        printf("length mismatch in constructed second preimage (pos=%zu, exp=%u)\n",
+               pos, WORDS);
+    }
+
+    uint64_t h2 = hs48(mess2, L, 1, 0);
+    printf("second preimage hash : %06llX\n", (unsigned long long)h2);
+
+    if (h2 == h_target) {
+        printf("attack success: hashes match\n");
+    } else {
+        printf("attack failed: hashes differ\n");
+    }
+
+	double t_attack1 = now_sec();
+	printf("Total attack time: %.3f s\n", t_attack1 - t_attack0);
+    free(mess2);
+    free(CV);
+    free(chain);
+    free(mess);
 }
+
 
 int main()
 {
@@ -386,5 +563,7 @@ int main()
 		return 1;
 	if (!test_em())
 		return 1;
+	
+	attack();
 	return 0;
 }
